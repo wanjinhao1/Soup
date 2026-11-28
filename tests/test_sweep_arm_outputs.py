@@ -143,3 +143,119 @@ def test_a_mlx_sweep_records_a_distinct_output_dir_per_arm(
     assert arm_outputs[0] != arm_outputs[1], arm_outputs
     plain = " ".join(strip_ansi(result.output).split())
     assert "failed" not in plain, plain
+
+
+_UNLEARN_CONFIG = """\
+base: hf/model
+task: unlearn
+training:
+  epochs: 1
+  unlearn_method: npo
+data:
+  train: ./t.jsonl
+  format: alpaca
+  forget_set: ./forget.jsonl
+output: shared-output
+"""
+
+
+def test_run_single_gives_each_unlearn_arm_its_own_output(
+    tmp_path, monkeypatch, arm_outputs
+):
+    """`training_output_dir` treats `task: unlearn` as flat like the MLX
+    backends, so a sweep of unlearn arms needs the same per-arm routing —
+    otherwise every arm overwrites the shared output's artifacts."""
+    from soup_cli.config.loader import load_config
+
+    monkeypatch.chdir(tmp_path)
+    config = _write_config(_UNLEARN_CONFIG, tmp_path)
+    cfg = load_config(config)
+
+    for idx, lr in enumerate((0.04, 0.01), start=1):
+        _run_single(cfg, {"training.lr": lr}, f"sweep_{idx}", config)
+
+    assert arm_outputs == [
+        str(Path("shared-output") / "sweep_1"),
+        str(Path("shared-output") / "sweep_2"),
+    ], arm_outputs
+
+
+def test_a_mlx_sweep_preserves_each_arms_artifacts_and_tracker_paths(
+    tmp_path, monkeypatch
+):
+    """End to end: the stub trainer writes one distinct artifact per arm, and
+    the run provenance and tracker must both see the arm's own output
+    directory survive the two-arm run (sweep.py passes `result["output_dir"]`
+    to `write_run_provenance` and `tracker.finish_run`)."""
+    from soup_cli.commands.sweep import _run_single
+
+    monkeypatch.chdir(tmp_path)
+    config = _write_config(_MLX_CONFIG, tmp_path)
+    from soup_cli.config.loader import load_config
+
+    cfg = load_config(config)
+
+    artifact_paths: list[str] = []
+    provenance_paths: list[str] = []
+    tracker_output_dirs: list[str] = []
+
+    def build_trainer(arm_cfg, device=None):
+        trainer = Mock()
+
+        def train(display=None, tracker=None, run_id=None):
+            artifact = Path(arm_cfg.output) / "adapters.safetensors"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_bytes(b"arm artifact " + arm_cfg.output.encode())
+            artifact_paths.append(str(artifact))
+            return {
+                "initial_loss": 2.0,
+                "final_loss": 1.0,
+                "total_steps": 1,
+                "duration_secs": 0.1,
+                "output_dir": arm_cfg.output,
+            }
+
+        trainer.train.side_effect = train
+        trainer.setup.return_value = None
+        return trainer
+
+    class _StubTracker:
+        def start_run(self, **kwargs):
+            return f"run-{len(tracker_output_dirs) + 1}"
+
+        def record_base_revision(self, run_id, **kwargs):
+            pass
+
+        def finish_run(self, **kwargs):
+            tracker_output_dirs.append(kwargs["output_dir"])
+
+        def fail_run(self, run_id, **kwargs):
+            pass
+
+    monkeypatch.setattr("soup_cli.trainer.dispatch.build_trainer", build_trainer)
+    monkeypatch.setattr(
+        "soup_cli.data.loader.load_dataset", lambda *a, **kw: {"train": [{}]}
+    )
+    monkeypatch.setattr("soup_cli.utils.gpu.get_gpu_info", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        "soup_cli.utils.gpu.detect_device", lambda *a, **kw: ("mps", "mps")
+    )
+    monkeypatch.setattr(
+        "soup_cli.utils.run_provenance.write_run_provenance",
+        lambda output_dir, metadata: provenance_paths.append(output_dir),
+    )
+    monkeypatch.setattr(
+        "soup_cli.experiment.tracker.ExperimentTracker", _StubTracker
+    )
+
+    for idx, lr in enumerate((0.04, 0.01), start=1):
+        _run_single(cfg, {"training.lr": lr}, f"sweep_{idx}", config)
+
+    assert len(artifact_paths) == 2, artifact_paths
+    assert all(Path(p).exists() for p in artifact_paths), artifact_paths
+    assert {Path(p).parent.name for p in artifact_paths} == {"sweep_1", "sweep_2"}
+    assert tracker_output_dirs == [
+        str(Path("shared-output") / "sweep_1"),
+        str(Path("shared-output") / "sweep_2"),
+    ], tracker_output_dirs
+    assert provenance_paths == tracker_output_dirs, provenance_paths
