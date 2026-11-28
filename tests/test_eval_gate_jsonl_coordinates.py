@@ -67,13 +67,24 @@ def test_run_gate_returns_task_error_without_generation_or_judging(
     )
     suite = gate.EvalSuite(suite="s", tasks=[task()])
     seen: list[str] = []
+    judged: list[str] = []
 
     def generate_fn(prompt: str) -> str:
         seen.append(prompt)
         return "synthetic"
 
+    from soup_cli.eval.judge import JudgeEvaluator
+
+    monkeypatch.setattr(
+        JudgeEvaluator, "_call_llm",
+        lambda self, prompt: judged.append(prompt) or json.dumps(
+            {"scores": {"helpfulness": 5, "accuracy": 5, "safety": 5}}
+        ),
+    )
+
     result = gate.run_gate(suite, generate_fn=generate_fn)
     assert seen == []
+    assert judged == []
     assert len(result.task_results) == 1
     task_result = result.task_results[0]
     assert task_result.score is None
@@ -115,8 +126,17 @@ def test_valid_rows_still_load_after_the_rebase(
         ),
     )
     seen: list[str] = []
-    gate._run_judge_task(task(), lambda prompt: seen.append(prompt) or "ok")
+    judged: list[str] = []
+    monkeypatch.setattr(
+        JudgeEvaluator, "_call_llm",
+        lambda self, prompt: judged.append(prompt) or json.dumps(
+            {"scores": {"helpfulness": 5, "accuracy": 5, "safety": 5}}
+        ),
+    )
+    score = gate._run_judge_task(task(), lambda prompt: seen.append(prompt) or "ok")
     assert seen == ["p", "q"]
+    assert len(judged) == 2, judged
+    assert score == 1.0, score
 
 
 def test_row_wrapped_in_unicode_blanks_still_parses_and_keeps_columns(
